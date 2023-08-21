@@ -1,8 +1,9 @@
 package main
 
 import (
-	"time"
+	"fmt"
 
+	"github.com/draganm/scotty/k8sexec"
 	"github.com/gliderlabs/ssh"
 	"github.com/go-logr/zapr"
 	"github.com/urfave/cli/v2"
@@ -21,8 +22,6 @@ func main() {
 			EncodeLevel: zapcore.CapitalLevelEncoder,
 			TimeKey:     "time",
 			EncodeTime:  zapcore.ISO8601TimeEncoder,
-			// CallerKey:    "caller",
-			// EncodeCaller: zapcore.ShortCallerEncoder,
 		},
 	}.Build()
 
@@ -41,6 +40,12 @@ func main() {
 		Action: func(c *cli.Context) error {
 			log := zapr.NewLogger(logger)
 			log.Info("started")
+
+			ke, err := k8sexec.NewK8SExecutor()
+			if err != nil {
+				return fmt.Errorf("could not create new k8s executor: %w", err)
+			}
+
 			ssh.ListenAndServe(
 				c.String(`addr`),
 				func(s ssh.Session) {
@@ -56,6 +61,12 @@ func main() {
 
 					ctx := s.Context()
 
+					sizeEvents := make(chan k8sexec.WindowSize, 1)
+					sizeEvents <- k8sexec.WindowSize{
+						Width:  pt.Window.Height,
+						Height: pt.Window.Width,
+					}
+
 					if hasPty {
 						go func() {
 							for ctx.Err() == nil {
@@ -64,15 +75,36 @@ func main() {
 									log.Info("context done")
 									return
 								case ev := <-evs:
-									log.Info("event", "window", ev)
-
+									// log.Info("event", "window", ev)
+									// s.Write([]byte("event!\n"))
+									sizeEvents <- k8sexec.WindowSize{
+										Width:  ev.Width,
+										Height: ev.Height,
+									}
 								}
 							}
+
 						}()
 					}
 
-					time.Sleep(20 * time.Second)
-					s.Close()
+					err = ke.RunOnPod(
+						ctx,
+						"hook-hub",
+						"hook-hub-0",
+						"hook-hub",
+						[]string{"/bin/sh"},
+						s,
+						s,
+						s.Stderr(),
+						hasPty,
+						sizeEvents,
+					)
+
+					if err != nil {
+						s.Exit(1)
+					} else {
+						s.Close()
+					}
 				},
 			)
 			return nil
