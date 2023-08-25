@@ -10,7 +10,7 @@ import (
 	bm "github.com/charmbracelet/wish/bubbletea"
 	"github.com/draganm/scotty/k8sexec"
 	"github.com/draganm/scotty/k8sutil"
-	"github.com/draganm/scotty/tui/itemselector"
+	"github.com/draganm/scotty/tui"
 	"github.com/go-logr/zapr"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
@@ -57,18 +57,13 @@ func main() {
 				return fmt.Errorf("could not create new k8s client: %w", err)
 			}
 
-			middlewares := teaHandler(cl, ke)
+			// middlewares :=
 
 			s, err := wish.NewServer(
 				wish.WithAddress(c.String(`addr`)),
 				wish.WithHostKeyPath(".ssh/term_info_ed25519"),
 				wish.WithMiddleware(
-					middlewares...,
-				// bm.Middleware(teaHandler(cl)),
-				// func(h ssh.Handler) ssh.Handler {
-				// 	return h
-				// },
-				// lm.Middleware(),
+					teaHandler(cl, ke),
 				),
 			)
 
@@ -78,82 +73,22 @@ func main() {
 
 			return s.ListenAndServe()
 
-			// ssh.ListenAndServe(
-			// 	c.String(`addr`),
-			// 	func(s ssh.Session) {
-			// 		pt, evs, hasPty := s.Pty()
-			// 		log.Info(
-			// 			"new connection",
-			// 			"remote", s.RemoteAddr().String(),
-			// 			"user", s.User(),
-			// 			"pty", hasPty,
-			// 			"term", pt.Term,
-			// 			"termWindow", pt.Window,
-			// 		)
-
-			// 		ctx := s.Context()
-
-			// 		sizeEvents := make(chan k8sexec.WindowSize, 1)
-			// 		sizeEvents <- k8sexec.WindowSize{
-			// 			Width:  pt.Window.Height,
-			// 			Height: pt.Window.Width,
-			// 		}
-
-			// 		if hasPty {
-			// 			go func() {
-			// 				for ctx.Err() == nil {
-			// 					select {
-			// 					case <-ctx.Done():
-			// 						log.Info("context done")
-			// 						return
-			// 					case ev := <-evs:
-			// 						// log.Info("event", "window", ev)
-			// 						// s.Write([]byte("event!\n"))
-			// 						sizeEvents <- k8sexec.WindowSize{
-			// 							Width:  ev.Width,
-			// 							Height: ev.Height,
-			// 						}
-			// 					}
-			// 				}
-
-			// 			}()
-			// 		}
-
-			// 		err = ke.RunOnPod(
-			// 			ctx,
-			// 			"hook-hub",
-			// 			"hook-hub-0",
-			// 			"hook-hub",
-			// 			[]string{"/bin/sh"},
-			// 			s,
-			// 			s,
-			// 			s.Stderr(),
-			// 			hasPty,
-			// 			sizeEvents,
-			// 		)
-
-			// 		if err != nil {
-			// 			s.Exit(1)
-			// 		} else {
-			// 			s.Close()
-			// 		}
-			// 	},
-			// )
 			return nil
 		},
 	}
 	app.RunAndExitOnError()
 }
 
-func teaHandler(cl *k8sutil.Client, ke *k8sexec.K8SExecutor) []wish.Middleware {
+func teaHandler(cl *k8sutil.Client, ke *k8sexec.K8SExecutor) wish.Middleware {
 
-	var ns, pod, container string
-	return []wish.Middleware{
-		func(h ssh.Handler) ssh.Handler {
+	return func(h ssh.Handler) ssh.Handler {
+		cs := &tui.CurrentSelection{}
+
+		m1 := func(h ssh.Handler) ssh.Handler {
 
 			return func(s ssh.Session) {
 
-				wish.Printf(s, "ns: %s, pod: %s\n", ns, pod)
+				// wish.Printf(s, "ns: %s, pod: %s\n", ns, pod)
 
 				pt, evs, hasPty := s.Pty()
 				log.Info(
@@ -195,10 +130,10 @@ func teaHandler(cl *k8sutil.Client, ke *k8sexec.K8SExecutor) []wish.Middleware {
 
 				err := ke.RunOnPod(
 					ctx,
-					ns,
-					pod,
-					container,
-					[]string{"/bin/sh"},
+					cs.Namespace,
+					cs.Pod,
+					cs.Container,
+					[]string{cs.Command},
 					s,
 					s,
 					s.Stderr(),
@@ -214,48 +149,15 @@ func teaHandler(cl *k8sutil.Client, ke *k8sexec.K8SExecutor) []wish.Middleware {
 
 			}
 
-		},
-		bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-			p, _, _ := s.Pty()
-			pods, err := cl.ListContainers(s.Context(), ns, pod)
+		}
 
-			if err != nil {
-				wish.Error(s, fmt.Errorf("could not list containers: %w", err))
-				return nil, nil
-			}
+		m2 := bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+			kl := &k8sLister{ctx: s.Context(), kc: cl}
+			return tui.SelectContainerAndCommand(cs, kl), []tea.ProgramOption{tea.WithAltScreen()}
+		})
 
-			return itemselector.SelectItem("Container", pods, func(s string) {
-				container = s
-			}, p.Window), []tea.ProgramOption{tea.WithAltScreen()}
+		return m2(m1(h))
 
-		}),
-		bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-			p, _, _ := s.Pty()
-			pods, err := cl.ListPods(s.Context(), ns)
-
-			if err != nil {
-				wish.Error(s, fmt.Errorf("could not list pods: %w", err))
-				return nil, nil
-			}
-
-			return itemselector.SelectItem("Pod", pods, func(s string) {
-				pod = s
-			}, p.Window), []tea.ProgramOption{tea.WithAltScreen()}
-
-		}),
-		bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-			p, _, _ := s.Pty()
-			namespaces, err := cl.ListNamespaces(s.Context())
-
-			if err != nil {
-				wish.Error(s, fmt.Errorf("could not list namespaces: %w", err))
-				return nil, nil
-			}
-
-			return itemselector.SelectItem("Namespace", namespaces, func(s string) {
-				ns = s
-			}, p.Window), []tea.ProgramOption{tea.WithAltScreen()}
-
-		}),
 	}
+
 }
